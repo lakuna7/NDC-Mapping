@@ -1,0 +1,23 @@
+{
+  "input": "0006-0277",
+  "input_digits": "00060277",
+  "input_kind": "product",
+  "derived_ndc9": "000060277",
+  "scope": "product_all_packages",
+  "brands": [
+    "JANUVIA"
+  ],
+  "brand_count": 1,
+  "product_count": 1,
+  "ndc11_count": 7,
+  "ndc11s": [
+    "00006027702",
+    "00006027714",
+    "00006027728",
+    "00006027731",
+    "00006027733",
+    "00006027754",
+    "00006027782"
+  ],
+  "outdir": "/root/ndc_source_matrix_0006-0277"
+}
