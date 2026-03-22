@@ -20,6 +20,11 @@ CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
 
 export INPUT OPENFDA_API_KEY MAX_WORKERS CACHE_TTL_HOURS
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export PROJECT_ROOT
+export BASH_SOURCE_DIR="$SCRIPT_DIR"
+
 exec python3 - <<'ENDOFPYTHON'
 import csv
 import hashlib
@@ -91,16 +96,23 @@ def safe_filename(x):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", _s(x))
 
 INPUT_SAFE = safe_filename(INPUT) if INPUT else "EMPTY"
-_outdir_env = os.environ.get("OUTDIR", "").strip()
-if _outdir_env:
-    OUTDIR = Path(_outdir_env)
+_root_env = os.environ.get("PROJECT_ROOT", "").strip()
+if _root_env:
+    PROJECT_ROOT = Path(_root_env)
 else:
-    OUTDIR = Path.home() / ("ndc_geo_matrix_" + INPUT_SAFE)
-CACHE_DIR = OUTDIR / "cache"
-CSV_DIR = OUTDIR / "state_tables"
-OUTDIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CSV_DIR.mkdir(parents=True, exist_ok=True)
+    _script_dir = Path(os.environ.get("BASH_SOURCE_DIR", "")).resolve() if os.environ.get("BASH_SOURCE_DIR") else Path.cwd()
+    if _script_dir.name == "commands":
+        PROJECT_ROOT = _script_dir.parent
+    else:
+        PROJECT_ROOT = _script_dir
+TABLES_DIR = PROJECT_ROOT / "exports" / "tables" / ("geo_matrix_" + INPUT_SAFE)
+CSV_DIR = TABLES_DIR / "state_tables"
+LOGS_DIR = PROJECT_ROOT / "exports" / "logs"
+DEBUG_DIR = PROJECT_ROOT / "exports" / "debug"
+CACHE_DIR = PROJECT_ROOT / "local-data" / ("cache_geo_matrix_" + INPUT_SAFE)
+for d in [TABLES_DIR, CSV_DIR, LOGS_DIR, DEBUG_DIR, CACHE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+OUTDIR = TABLES_DIR
 
 def log(msg):
     print("[ndc-geo] " + _s(msg), file=sys.stderr, flush=True)
@@ -796,7 +808,7 @@ try:
         for ci, col in enumerate(STATE_COLS, 1):
             ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = max(12, len(col) + 2)
 
-    xlsx_path = OUTDIR / "ndc_geo_matrix.xlsx"
+    xlsx_path = DEBUG_DIR / ("ndc_geo_matrix_" + INPUT_SAFE + ".xlsx")
     wb.save(str(xlsx_path))
     log("Workbook saved: " + str(xlsx_path))
 except ImportError:
@@ -810,7 +822,7 @@ except Exception as exc:
 # PHASE 7: WRITE MANIFEST AND RUN LOG
 # ============================================================
 
-manifest_path = OUTDIR / "manifest.csv"
+manifest_path = DEBUG_DIR / ("manifest_geo_" + INPUT_SAFE + ".csv")
 with open(str(manifest_path), "w", newline="", encoding="utf-8") as fh:
     mcols = ["ndc11", "ndc11_display", "brand_name", "product_display",
              "package_display", "sdud_status", "states_with_data", "csv_file"]
@@ -858,7 +870,7 @@ run_log = {
     },
 }
 
-run_log_path = OUTDIR / "run_log.json"
+run_log_path = LOGS_DIR / ("run_log_geo_" + INPUT_SAFE + ".json")
 run_log_path.write_text(json.dumps(run_log, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # ============================================================

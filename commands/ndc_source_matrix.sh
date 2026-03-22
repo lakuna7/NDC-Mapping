@@ -22,6 +22,12 @@ INCLUDE_WAC="${INCLUDE_WAC:-1}"
 
 export INPUT OPENFDA_API_KEY MAX_WORKERS CACHE_TTL_HOURS INCLUDE_WAC
 
+# Detect project root from script location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export PROJECT_ROOT
+export BASH_SOURCE_DIR="$SCRIPT_DIR"
+
 exec python3 - <<'ENDOFPYTHON'
 # -*- coding: utf-8 -*-
 import csv
@@ -69,14 +75,24 @@ def safe_filename(x):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", _s(x))
 
 INPUT_SAFE = safe_filename(INPUT) if INPUT else "EMPTY"
-_outdir_env = os.environ.get("OUTDIR", "").strip()
-if _outdir_env:
-    OUTDIR = Path(_outdir_env)
+_root_env = os.environ.get("PROJECT_ROOT", "").strip()
+if _root_env:
+    PROJECT_ROOT = Path(_root_env)
 else:
-    OUTDIR = Path.home() / ("ndc_source_matrix_" + INPUT_SAFE)
-CACHE_DIR = OUTDIR / "cache"
-OUTDIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Auto-detect: script lives in commands/, root is one level up
+    _script_dir = Path(os.environ.get("BASH_SOURCE_DIR", "")).resolve() if os.environ.get("BASH_SOURCE_DIR") else Path.cwd()
+    if _script_dir.name == "commands":
+        PROJECT_ROOT = _script_dir.parent
+    else:
+        PROJECT_ROOT = _script_dir
+TABLES_DIR = PROJECT_ROOT / "exports" / "tables" / ("source_matrix_" + INPUT_SAFE)
+LOGS_DIR = PROJECT_ROOT / "exports" / "logs"
+DEBUG_DIR = PROJECT_ROOT / "exports" / "debug"
+CACHE_DIR = PROJECT_ROOT / "local-data" / ("cache_source_matrix_" + INPUT_SAFE)
+for d in [TABLES_DIR, LOGS_DIR, DEBUG_DIR, CACHE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+# Backward compat alias
+OUTDIR = TABLES_DIR
 
 def log(msg):
     print("[ndc-matrix] " + str(msg), file=sys.stderr, flush=True)
@@ -1014,7 +1030,7 @@ def write_csv(path, rows, cols):
 
 csv_p = OUTDIR / "ndc11_source_matrix.csv"
 cmp_p = OUTDIR / "ndc11_compact.csv"
-res_p = OUTDIR / "resolution.json"
+res_p = LOGS_DIR / ("resolution_source_matrix_" + INPUT_SAFE + ".json")
 
 write_csv(csv_p, matrix, COLS)
 write_csv(cmp_p, matrix, COMPACT)
@@ -1065,4 +1081,3 @@ for r in matrix[0:15]:
     print("  " + " | ".join("{:<22}".format(str(r.get(c, ""))) for c in pc))
 print("")
 ENDOFPYTHON
-
