@@ -1,6 +1,6 @@
 # NDC Intelligence System - Master Context
 
-Version: 2.1 (2026-09-24)
+Version: 2.2 (2026-09-24)
 Supersedes: BOOTSTRAP.md v1 (85 lines, February layout) as the session loader.
 Scope: everything needed to resume work on the NDC scripts without re-auditing: environment, full development history, current file state, architecture, sources, rules, today's patches, the open-issue register, and the roadmap.
 
@@ -181,7 +181,7 @@ Deferred: FAERS, Formulary PUF, Part D Prescribers, RxClass ATC (reasons in sect
 | File | Lines | Layout | State | Notes |
 |---|---|---|---|---|
 | `ndc_source_matrix.sh` | 1,194 | project | **Patched 2026-09-24** | SDUD pagination, XX exclusion, NADAC sort, Part B Overall, 3 new columns |
-| `ndc_geo_matrix.sh` | 1,009 | project | **Patched 2026-09-24** | SDUD pagination, XX exclusion, NADAC sort, completeness warnings |
+| `ndc_geo_matrix.sh` | 1,028 | project | **Patched 2026-09-24** | SDUD pagination, XX exclusion, NADAC sort, completeness warnings, territory rows (P6) |
 | `ndc_shortages.sh` | 631 | project | **Patched 2026-09-24** | Displayed record taken from current records; real date parsing |
 | `ndc_derived_kpis.sh` | 425 | project | Unchanged | Accepts `INPUT=`; writes to `exports/tables/derived_kpis/` |
 | `ndc_lookup.sh` | 446 | project | Unchanged | Pre-flight family browser; not yet in repo |
@@ -335,9 +335,9 @@ Brand-level groups repeat the same value on every NDC-11 of the brand. Never sum
 
 `ndc11_compact.csv`: identity plus status columns plus NADAC price, for quick scanning.
 
-### 7.2 State tables (`state_<ndc11>.csv`, 51 rows, 28 columns)
+### 7.2 State tables (`state_<ndc11>.csv`, 51 rows plus any other SDUD jurisdiction, 28 columns)
 `state_code, state_name, ndc11, ndc11_display, brand_name, product_ndc, product_display, package_display, sdud_status, sdud_record_count, latest_period, period_count, total_units_reimbursed, total_prescriptions, total_amount_reimbursed, medicaid_amount_reimbursed, non_medicaid_amount_reimbursed, ffsu_units, ffsu_prescriptions, ffsu_total_amount, mcou_units, mcou_prescriptions, mcou_total_amount, suppression_flag_present, nadac_latest_per_unit, nadac_effective_date, nadac_pricing_unit, notes`
-State measures come from SDUD only; the three NADAC columns are identical in every state row.
+State measures come from SDUD only; the three NADAC columns are identical in every state row. Since P6, jurisdictions outside the 50 states + DC that appear in SDUD (for example PR) are appended as extra rows with `notes` = "jurisdiction outside the 50 states + DC"; the geo manifest adds `other_jurisdictions` and `other_with_data`, and `states_with_data` still counts only the 50 states + DC. Derived KPI2 (HHI) includes those rows when they carry units.
 
 ### 7.3 Shortages (`ndc11_shortages.csv`, 15 columns)
 `ndc11, ndc11_display, brand_name, generic_name, product_ndc, shortage_flag, shortage_status, shortage_count, shortage_availability, shortage_reason, shortage_initial_date, shortage_update_date, shortage_generic_name, shortage_company, shortage_source_status`
@@ -376,7 +376,7 @@ The extension document says 25 columns; the script produces 21. Known methodolog
 
 ## 8. Patches applied on 2026-09-24
 
-Delivered as drop-in replacements for `ndc_source_matrix.sh`, `ndc_geo_matrix.sh`, `ndc_shortages.sh`. Compatible with `run.py` unchanged. Built from the project-layout versions.
+Delivered as drop-in replacements for `ndc_source_matrix.sh`, `ndc_geo_matrix.sh`, `ndc_shortages.sh` (P1 to P5), then `ndc_geo_matrix.sh` again and the workflow (P6, W1). Compatible with `run.py` unchanged. Built from the project-layout versions.
 
 | # | Fix | Files | What changed |
 |---|---|---|---|
@@ -385,16 +385,18 @@ Delivered as drop-in replacements for `ndc_source_matrix.sh`, `ndc_geo_matrix.sh
 | P3 | NADAC server-side sort | source, geo | Query sorts `effective_date` descending on the server; automatic fallback to the unsorted query if rejected; client-side sort retained. New column `nadac_sort` (`server_desc` or `client_only`). |
 | P4 | Part B Overall row | source | Annual and quarterly Part B now pass through `pick_ov`, as Part D and Medicaid already did. |
 | P5 | Shortage displayed record | shortages | The displayed record is chosen from current (unresolved) records, so status always agrees with `shortage_flag`. Dates parsed as real dates (ISO, MM/DD/YYYY, YYYYMMDD). |
+| P6 | Territory rows | geo | SDUD codes outside the 50 states + DC (other than `XX`) were silently dropped from state tables while the source matrix counted them (I-31). They are now appended as extra rows and reported in warnings and the manifest. Tested end to end against a simulated API (CA, TX, PR and XX rows: 52 rows written, PR kept, XX excluded). |
+| W1 | Workbook on runner | workflow | `openpyxl` installed before the scripts run, so the geo xlsx is generated. |
 
 **Tests run in the sandbox:** all three compile; bash syntax clean; zero non-ASCII bytes. Pagination and NADAC helpers passed eight tests against a simulated API: page cap of 100 on 1,200 rows; no total count reported; error on page 2; error on page 1; the 40-page stop; empty result; sort rejected; sort accepted. The shortage test reproduced the old bug (Resolved record displayed under flag `Y`) and confirmed the fix.
 
 **Evidence the SDUD fix mattered:** the documented JANUVIA output (`state_00006027731.csv`) shows all 51 states with data, most with both FFSU and MCOU. One year can reach 51 x 4 x 2 = 408 rows, above the old limit of 200, so source-matrix national totals for 0006-0277 were very likely truncated before this patch.
 
-**Assumptions not yet verified live** (see section 14):
-1. data.medicaid.gov accepts `sorts[0][property]` / `sorts[0][order]` (fallback covers a rejection).
-2. The datastore response includes a `count` field (a page-size heuristic covers its absence).
-3. SDUD national rows use state code `XX`.
-4. CMS Part B datasets carry a `Mftr_Name` column with Overall rows (if absent, `pick_ov` returns all rows, which is the previous behaviour).
+**Assumptions, status after live run #1 (2026-09-24, `0006-0277-31`):**
+1. Sort parameter accepted: **verified** (`nadac_sort` = `server_desc`, latest date 2026-09-23).
+2. `count` field in datastore responses: not directly observable (350 rows fit in one page); moot, completeness reported `complete`.
+3. National rows use `XX`: **verified** (8 rows excluded: 4 quarters x FFSU/MCOU).
+4. Part B `Mftr_Name` / Overall rows: **untested** (JANUVIA is oral; Part B returns `no_data`). Test with a Part B product such as `0006-3026`.
 
 **First run after patching** is slower: the new URLs miss the cache.
 
@@ -407,7 +409,7 @@ Status as of 2026-09-24.
 
 | ID | Sev | File | Issue | Status | Fix sketch |
 |---|---|---|---|---|---|
-| I-1 | H | source | SDUD `limit=200`, no pagination: silent truncation for high-volume packages | **Fixed (P1)** | - |
+| I-1 | H | source | SDUD `limit=200`, no pagination: silent truncation for high-volume packages | **Fixed (P1), verified live**: 0006-0277-31 has 350 SDUD rows (342 state + 8 national), so pre-fix outputs held at most 200 (about 40% missing) | - |
 | I-2 | H | source | SDUD national-total rows summed with states | **Fixed (P2)**, verify `XX` live | - |
 | I-3 | M | source, geo | NADAC "latest" chosen from an unsorted page of 50 | **Fixed (P3)** | - |
 | I-4 | H | source | Part B annual/quarterly summed manufacturer rows plus Overall | **Fixed (P4)**, verify column live | - |
@@ -430,13 +432,14 @@ Status as of 2026-09-24.
 | I-21 | H | repo | Repo held the old-layout `ndc_shortages.sh` and `ndc_derived_kpis.sh` (Copilot mapping used the `_clean` copies) | **Fixed 2026-09-24** (direct upload) | - |
 | I-22 | L | local | `_clean` duplicates identical to the old versions | Open | Delete |
 | I-23 | L | all, run.py | `INPUT` defaults to `0006`; help text and docs use Merck examples | Open | Make `INPUT` required; neutral examples |
-| I-24 | M | reference | `source-log.md` contains an invented KEYTRUDA Part D row (round figures; KEYTRUDA is Part B); extension doc cites "$945/unit for JANUVIA" | Open | Replace with real fetched rows or mark clearly illustrative |
+| I-24 | M | reference | `source-log.md` contains an invented KEYTRUDA Part D row (round figures; KEYTRUDA is Part B). Extension doc's "$945/unit for JANUVIA" is mislabelled: live data shows $945.51 is Part D average cost per **claim**; per unit is $17.97 | Open | Replace the KEYTRUDA row with real fetched data or mark it illustrative; relabel the JANUVIA figure as per claim |
 | I-25 | L | source | WAC returns 403 from cloud hosts | Known limitation | Manual CSV pull, or run WAC from the laptop |
 | I-26 | L | source | DailyMed name search returns SPLs from other labelers with the same name | Open | Filter by set id against openFDA `spl_set_id` |
 | I-27 | L | source | Part D quarterly: which quarter lands first is arbitrary; period records the year only | Open | Sort by year and quarter; record both |
 | I-28 | L | lookup | Numeric input only; no brand-name search | Enhancement | openFDA `brand_name:"X"` query |
 | I-29 | M | derived | Output path `exports/tables/derived_kpis/ndc11_derived_kpis.csv` is not keyed by input: each run overwrites the last | Open | Key the folder or filename by `INPUT` |
 | I-30 | L | docs | README, extension doc and BOOTSTRAP v1 carry old `~/ndc_*` paths and old run commands | Open | Update when the repo is refreshed |
+| I-31 | L | geo | State tables dropped SDUD jurisdictions outside the 50 states + DC (4 PR-type rows for 0006-0277-31) while the source matrix counted 52 states | **Fixed (P6)** | - |
 
 **Recommended next batch, in order:** I-22 (delete local `_clean` copies) -> I-16 and I-17 (source-matrix SDUD honesty) -> I-8 (shortage grain) -> I-6 and I-7 (KPI definitions) -> I-29 -> I-23 and I-24 (neutral defaults, clean references) -> I-10, I-12, I-14.
 
@@ -528,6 +531,7 @@ Then on the VPS: `cd ~/my-ndc-project && git pull`, and run one package to confi
 | 2026-09-23 | Full code review: 15 methodology issues identified; repo made private |
 | 2026-09-24 | Inventory; `_clean` discrepancy found (I-21); patches P1 to P5; extension document re-read against code (I-16 to I-19); this document (v2.0); GitHub Actions workflow added |
 | 2026-09-24 | v2.1: repo name corrected to `NDC-Mapping`; direct-upload refresh done (I-21 fixed); upload procedure for iOS documented |
+| 2026-09-24 | v2.2: first live Actions run recorded (14.1); P6 territory rows in geo (I-31); W1 openpyxl on runner; I-1 verified live; I-24 relabelled |
 
 Dates before September are approximate, inferred from file names and the formulary release date.
 
@@ -544,3 +548,21 @@ Run one high-volume package, for example `INPUT="0006-0277-31"`, with the patche
 6. `grep -c "partial\|truncated" exports/logs/run_log_geo_*.json` returns 0 for normal packages.
 7. Shortages: any `Y` row shows a non-Resolved `shortage_status`.
 Record the outcome of each check in this section, then remove the corresponding assumption from section 8.
+
+### 14.1 Live run #1 (GitHub Actions, 2026-09-24, `0006-0277-31`, all scripts, 42 s)
+| Check | Result |
+|---|---|
+| SDUD completeness | `complete`; `sdud_count` 342 after excluding 8 national rows |
+| National rows | `XX` confirmed, 8 excluded |
+| NADAC | `server_desc`; $10.5518 per EA, effective 2026-09-23 |
+| Source vs geo reconciliation | Exact: 21,296,310 units; 496,422 Rx; $384,530,370.80 Medicaid amount |
+| State counts | Source 52 codes / 342 rows vs geo 51 states / 338 rows: 4 rows from a non-state jurisdiction contributing zero (I-31, fixed by P6) |
+| Suppression | Geo flags CO, HI, IA, NH, RI, TN, TX; source matrix has no flag (I-17 confirmed) |
+| Part B | `no_data` as expected for an oral drug; Overall-row fix untested |
+| Shortages | `N` / `no_data`; P5 untested (needs a package with an active shortage) |
+| KPI1 | Spread 71% = SDUD 2024 $18.06/unit vs NADAC Sep 2026 $10.55; dominated by the 21-month period gap (I-6 confirmed); uses Medicaid amount $384.5M, total is $392.3M |
+| KPI4 | Medicaid $18.42 vs Part D $17.96 per unit, ratio 1.03; both 2024, aligned by coincidence (I-7 still open) |
+| Part D | Annual 2024 $3.81B spend; $17.97 per unit; $945.51 per claim (source of the mislabelled "$945/unit") |
+| Workbook | Not generated (`openpyxl` missing on runner); fixed by W1 |
+
+**Next live checks:** re-run `0006-0277-31` after P6/W1 (expect 52 geo rows, PR-type row noted, xlsx present); run a Part B product (`0006-3026`) for the Overall-row fix; run a package with an active shortage for P5.
