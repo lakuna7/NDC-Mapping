@@ -178,6 +178,107 @@ def fetch_many(urls, timeout=60, retries=2):
     return result
 
 # ============================================================
+# data.medicaid.gov (DKAN) QUERY HELPERS
+# Added: SDUD full pagination, national-row exclusion constant,
+# NADAC server-side sort with unsorted fallback.
+# ============================================================
+MEDICAID_BASE = "https://data.medicaid.gov/api/1/datastore/query/"
+NADAC_DATASET = "fbb83258-11c7-47f5-8b18-5f8e79f7e704"
+SDUD_DATASET = "61729e5a-7aa8-448c-8903-ba3e0cd0ea3c"
+MEDICAID_PAGE_SIZE = 500       # requested page size; the server may return fewer
+MEDICAID_MAX_PAGES = 40        # hard stop per NDC; hitting it is reported, never silent
+NATIONAL_STATE_CODES = {"XX"}  # SDUD national-total rows: never summed with state rows
+
+def medicaid_url(dataset_id, ndc11, limit, offset, sort_prop=None, sort_order="desc"):
+    params = {
+        "conditions[0][property]": "ndc",
+        "conditions[0][value]": ndc11,
+        "conditions[0][operator]": "=",
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    if sort_prop:
+        params["sorts[0][property]"] = sort_prop
+        params["sorts[0][order]"] = sort_order
+    return MEDICAID_BASE + dataset_id + "/0?" + urllib.parse.urlencode(params)
+
+def _medicaid_rows(data):
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"]
+    if isinstance(data, list):
+        return data
+    return []
+
+def fetch_medicaid_all(dataset_id, ndc11, timeout=90, retries=2):
+    """Fetch every row for one NDC. Offset advances by rows actually received,
+    so a server-side page cap below MEDICAID_PAGE_SIZE cannot skip rows.
+    Returns an _error dict if page 1 fails; otherwise a dict with
+    results, _completeness (complete | partial_error | partial_short |
+    truncated_max_pages), _pages and _total_reported."""
+    rows = []
+    total = None
+    pages = 0
+    completeness = "complete"
+    for _ in range(MEDICAID_MAX_PAGES):
+        url = medicaid_url(dataset_id, ndc11, MEDICAID_PAGE_SIZE, len(rows))
+        data = http_get_json(url, timeout=timeout, retries=retries)
+        if is_err(data):
+            if pages == 0:
+                return data
+            completeness = "partial_error"
+            break
+        batch = _medicaid_rows(data)
+        pages += 1
+        if total is None and isinstance(data, dict):
+            try:
+                total = int(data.get("count"))
+            except (TypeError, ValueError):
+                total = None
+        rows.extend(batch)
+        if not batch:
+            break
+        if total is not None and len(rows) >= total:
+            break
+        if total is None and len(batch) < MEDICAID_PAGE_SIZE:
+            break
+    else:
+        completeness = "truncated_max_pages"
+    if completeness == "complete" and total is not None and len(rows) < total:
+        completeness = "partial_short"
+    return {"results": rows, "_completeness": completeness,
+            "_pages": pages, "_total_reported": total}
+
+def fetch_nadac_latest(ndc11, timeout=90, retries=2):
+    """NADAC rows sorted newest first on the server. If the sorted query
+    fails, fall back to the unsorted query; the caller still sorts
+    client-side, so the result is never worse than before."""
+    url = medicaid_url(NADAC_DATASET, ndc11, 50, 0, sort_prop="effective_date", sort_order="desc")
+    data = http_get_json(url, timeout=timeout, retries=retries)
+    if not is_err(data):
+        if isinstance(data, dict):
+            data["_sort"] = "server_desc"
+        return data
+    fallback = http_get_json(medicaid_url(NADAC_DATASET, ndc11, 50, 0), timeout=timeout, retries=retries)
+    if isinstance(fallback, dict) and not is_err(fallback):
+        fallback["_sort"] = "client_only"
+    return fallback
+
+def fetch_parallel(fn, keys):
+    out = {}
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return out
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(keys))) as pool:
+        futs = {pool.submit(fn, k): k for k in keys}
+        for fut in as_completed(futs):
+            k = futs[fut]
+            try:
+                out[k] = fut.result()
+            except Exception as exc:
+                out[k] = {"_error": repr(exc)}
+    return out
+
+# ============================================================
 # NDC NORMALIZATION (same as ndc_source_matrix.sh)
 # ============================================================
 
@@ -470,34 +571,9 @@ log("Scope: " + str(len(all_ndc11)) + " NDC11s, " + str(len(brands)) + " brand(s
 
 log("Fetching SDUD (state-native) + NADAC (national reference)...")
 
-sdud_urls = {}
-nadac_urls = {}
-for n in all_ndc11:
-    sdud_urls[n] = (
-        "https://data.medicaid.gov/api/1/datastore/query/"
-        "61729e5a-7aa8-448c-8903-ba3e0cd0ea3c/0?"
-        + urllib.parse.urlencode({
-            "conditions[0][property]": "ndc",
-            "conditions[0][value]": n,
-            "conditions[0][operator]": "=",
-            "limit": "5000",
-            "offset": "0",
-        })
-    )
-    nadac_urls[n] = (
-        "https://data.medicaid.gov/api/1/datastore/query/"
-        "fbb83258-11c7-47f5-8b18-5f8e79f7e704/0?"
-        + urllib.parse.urlencode({
-            "conditions[0][property]": "ndc",
-            "conditions[0][value]": n,
-            "conditions[0][operator]": "=",
-            "limit": "50",
-            "offset": "0",
-        })
-    )
-
-all_urls = list(sdud_urls.values()) + list(nadac_urls.values())
-all_data = fetch_many(all_urls, timeout=120, retries=2)
+sdud_data = fetch_parallel(lambda n: fetch_medicaid_all(SDUD_DATASET, n, timeout=120), all_ndc11)
+nadac_data = fetch_parallel(lambda n: fetch_nadac_latest(n, timeout=120), all_ndc11)
+all_data = {}
 
 def G(url):
     return all_data.get(url, {"_error": "not_fetched", "_url": url})
@@ -585,7 +661,7 @@ for ndc11 in all_ndc11:
     info = ndc11_info[ndc11]
 
     # --- Get NADAC reference (national, not state) ---
-    nad_raw = G(nadac_urls[ndc11])
+    nad_raw = nadac_data.get(ndc11, {"_error": "not_fetched"})
     nadac_ref = {"price": "", "date": "", "unit": ""}
     if not is_err(nad_raw):
         nad_recs = recs_med(nad_raw)
@@ -598,7 +674,7 @@ for ndc11 in all_ndc11:
             nadac_ref["unit"] = _s(la.get("pricing_unit", ""))
 
     # --- Get SDUD records and validate exact match ---
-    sdud_raw = G(sdud_urls[ndc11])
+    sdud_raw = sdud_data.get(ndc11, {"_error": "not_fetched"})
     sdud_status_global = S_NOT_QUERIED
     sdud_exact = []
 
@@ -610,7 +686,11 @@ for ndc11 in all_ndc11:
         if not sdud_recs:
             sdud_status_global = S_NO_DATA
         else:
-            sdud_exact = [r for r in sdud_recs if ndc_from_rec(r) == ndc11]
+            sdud_exact = [r for r in sdud_recs if ndc_from_rec(r) == ndc11
+                          and _s(r.get("state", "")).strip().upper() not in NATIONAL_STATE_CODES]
+            _comp = sdud_raw.get("_completeness", "") if isinstance(sdud_raw, dict) else ""
+            if _comp and _comp != "complete":
+                warnings.append("SDUD " + _comp + " for " + ndc11 + ": state totals may be incomplete")
             if sdud_exact:
                 sdud_status_global = S_HIT
             else:

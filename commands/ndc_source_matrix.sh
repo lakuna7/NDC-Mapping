@@ -153,6 +153,107 @@ def fetch_many(urls, timeout=60, retries=2):
                 result[u] = {"_error": repr(exc), "_url": u}
     return result
 
+# ============================================================
+# data.medicaid.gov (DKAN) QUERY HELPERS
+# Added: SDUD full pagination, national-row exclusion constant,
+# NADAC server-side sort with unsorted fallback.
+# ============================================================
+MEDICAID_BASE = "https://data.medicaid.gov/api/1/datastore/query/"
+NADAC_DATASET = "fbb83258-11c7-47f5-8b18-5f8e79f7e704"
+SDUD_DATASET = "61729e5a-7aa8-448c-8903-ba3e0cd0ea3c"
+MEDICAID_PAGE_SIZE = 500       # requested page size; the server may return fewer
+MEDICAID_MAX_PAGES = 40        # hard stop per NDC; hitting it is reported, never silent
+NATIONAL_STATE_CODES = {"XX"}  # SDUD national-total rows: never summed with state rows
+
+def medicaid_url(dataset_id, ndc11, limit, offset, sort_prop=None, sort_order="desc"):
+    params = {
+        "conditions[0][property]": "ndc",
+        "conditions[0][value]": ndc11,
+        "conditions[0][operator]": "=",
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    if sort_prop:
+        params["sorts[0][property]"] = sort_prop
+        params["sorts[0][order]"] = sort_order
+    return MEDICAID_BASE + dataset_id + "/0?" + urllib.parse.urlencode(params)
+
+def _medicaid_rows(data):
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"]
+    if isinstance(data, list):
+        return data
+    return []
+
+def fetch_medicaid_all(dataset_id, ndc11, timeout=90, retries=2):
+    """Fetch every row for one NDC. Offset advances by rows actually received,
+    so a server-side page cap below MEDICAID_PAGE_SIZE cannot skip rows.
+    Returns an _error dict if page 1 fails; otherwise a dict with
+    results, _completeness (complete | partial_error | partial_short |
+    truncated_max_pages), _pages and _total_reported."""
+    rows = []
+    total = None
+    pages = 0
+    completeness = "complete"
+    for _ in range(MEDICAID_MAX_PAGES):
+        url = medicaid_url(dataset_id, ndc11, MEDICAID_PAGE_SIZE, len(rows))
+        data = http_get_json(url, timeout=timeout, retries=retries)
+        if is_err(data):
+            if pages == 0:
+                return data
+            completeness = "partial_error"
+            break
+        batch = _medicaid_rows(data)
+        pages += 1
+        if total is None and isinstance(data, dict):
+            try:
+                total = int(data.get("count"))
+            except (TypeError, ValueError):
+                total = None
+        rows.extend(batch)
+        if not batch:
+            break
+        if total is not None and len(rows) >= total:
+            break
+        if total is None and len(batch) < MEDICAID_PAGE_SIZE:
+            break
+    else:
+        completeness = "truncated_max_pages"
+    if completeness == "complete" and total is not None and len(rows) < total:
+        completeness = "partial_short"
+    return {"results": rows, "_completeness": completeness,
+            "_pages": pages, "_total_reported": total}
+
+def fetch_nadac_latest(ndc11, timeout=90, retries=2):
+    """NADAC rows sorted newest first on the server. If the sorted query
+    fails, fall back to the unsorted query; the caller still sorts
+    client-side, so the result is never worse than before."""
+    url = medicaid_url(NADAC_DATASET, ndc11, 50, 0, sort_prop="effective_date", sort_order="desc")
+    data = http_get_json(url, timeout=timeout, retries=retries)
+    if not is_err(data):
+        if isinstance(data, dict):
+            data["_sort"] = "server_desc"
+        return data
+    fallback = http_get_json(medicaid_url(NADAC_DATASET, ndc11, 50, 0), timeout=timeout, retries=retries)
+    if isinstance(fallback, dict) and not is_err(fallback):
+        fallback["_sort"] = "client_only"
+    return fallback
+
+def fetch_parallel(fn, keys):
+    out = {}
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return out
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(keys))) as pool:
+        futs = {pool.submit(fn, k): k for k in keys}
+        for fut in as_completed(futs):
+            k = futs[fut]
+            try:
+                out[k] = fut.result()
+            except Exception as exc:
+                out[k] = {"_error": repr(exc)}
+    return out
+
 def normalize_ndc9(product_ndc):
     s = _ss(product_ndc)
     parts = s.split("-")
@@ -429,11 +530,7 @@ def cms_url(did, filters, size=5000, offset=0):
     qs["offset"] = str(offset)
     return "https://data.cms.gov/data-api/v1/dataset/" + did + "/data?" + urllib.parse.urlencode(qs)
 
-nadac_urls = {}
-sdud_urls = {}
-for n in all_ndc11:
-    nadac_urls[n] = ("https://data.medicaid.gov/api/1/datastore/query/fbb83258-11c7-47f5-8b18-5f8e79f7e704/0?" + urllib.parse.urlencode({"conditions[0][property]": "ndc", "conditions[0][value]": n, "conditions[0][operator]": "=", "limit": "50", "offset": "0"}))
-    sdud_urls[n] = ("https://data.medicaid.gov/api/1/datastore/query/61729e5a-7aa8-448c-8903-ba3e0cd0ea3c/0?" + urllib.parse.urlencode({"conditions[0][property]": "ndc", "conditions[0][value]": n, "conditions[0][operator]": "=", "limit": "200", "offset": "0"}))
+# NADAC and SDUD are fetched by dedicated helpers (server-sorted / fully paginated).
 
 wac_cur_urls = {}
 wac_hist_urls = {}
@@ -463,10 +560,13 @@ pb_ann_urls = {b: cms_url(PB_ANN, {"Brnd_Name": b}) for b in brands}
 pb_q_urls = {b: cms_url(PB_Q, {"Brnd_Name": b}) for b in brands}
 
 log("Fetching package-native sources...")
-all_pkg = list(nadac_urls.values()) + list(sdud_urls.values())
+all_pkg = []
 if INCLUDE_WAC:
     all_pkg += list(wac_cur_urls.values()) + list(wac_hist_urls.values())
 pkg_data = fetch_many(all_pkg, timeout=90, retries=2)
+log("Fetching NADAC (server-sorted) and SDUD (fully paginated)...")
+nadac_data = fetch_parallel(fetch_nadac_latest, all_ndc11)
+sdud_data = fetch_parallel(lambda n: fetch_medicaid_all(SDUD_DATASET, n), all_ndc11)
 
 log("Fetching brand-level sources...")
 all_brd = (list(drugsfda_urls.values()) + list(rxnav_urls.values()) + list(dailymed_urls.values()) + list(pd_ann_urls.values()) + list(pd_q_urls.values()) + list(mc_sp_urls.values()) + list(pb_ann_urls.values()) + list(pb_q_urls.values()))
@@ -557,10 +657,11 @@ log("Enriching package-native...")
 INIT = {
     "src_nadac": 0, "src_nadac_status": S_NOT_QUERIED,
     "nadac_eff_date": "", "nadac_per_unit": "", "nadac_unit": "",
-    "nadac_otc": "", "nadac_class": "", "nadac_count": "",
+    "nadac_otc": "", "nadac_class": "", "nadac_count": "", "nadac_sort": "",
     "src_sdud": 0, "src_sdud_status": S_NOT_QUERIED,
     "sdud_count": "", "sdud_year": "", "sdud_quarter": "",
     "sdud_states": "", "sdud_units": "", "sdud_rx": "", "sdud_reimb": "",
+    "sdud_national_excluded": "", "sdud_completeness": "",
     "src_wac_cur": 0, "src_wac_cur_status": S_NOT_QUERIED,
     "wac_cur_date": "", "wac_cur_price": "",
     "src_wac_hist": 0, "src_wac_hist_status": S_NOT_QUERIED,
@@ -591,7 +692,7 @@ for ndc11 in all_ndc11:
     row.update({k: v for k, v in INIT.items()})
 
     # NADAC
-    nd = G(nadac_urls[ndc11])
+    nd = nadac_data.get(ndc11, {"_error": "not_fetched"})
     if is_err(nd):
         row["src_nadac_status"] = S_QUERY_ERROR
     else:
@@ -604,6 +705,7 @@ for ndc11 in all_ndc11:
                 row["src_nadac"] = 1
                 row["src_nadac_status"] = S_HIT
                 row["nadac_count"] = str(len(exact))
+                row["nadac_sort"] = _s(nd.get("_sort", "")) if isinstance(nd, dict) else ""
                 exact.sort(key=lambda x: _s(x.get("effective_date", "")), reverse=True)
                 la = exact[0]
                 row["nadac_eff_date"] = _s(la.get("effective_date", ""))
@@ -616,7 +718,7 @@ for ndc11 in all_ndc11:
                 row["nadac_count"] = "0/" + str(len(nr))
 
     # SDUD
-    sd = G(sdud_urls[ndc11])
+    sd = sdud_data.get(ndc11, {"_error": "not_fetched"})
     if is_err(sd):
         row["src_sdud_status"] = S_QUERY_ERROR
     else:
@@ -624,7 +726,11 @@ for ndc11 in all_ndc11:
         if not sr:
             row["src_sdud_status"] = S_NO_DATA
         else:
-            exact = [x for x in sr if ndc_from_rec(x) == ndc11]
+            exact_all = [x for x in sr if ndc_from_rec(x) == ndc11]
+            national = [x for x in exact_all if _s(x.get("state", "")).strip().upper() in NATIONAL_STATE_CODES]
+            exact = [x for x in exact_all if _s(x.get("state", "")).strip().upper() not in NATIONAL_STATE_CODES]
+            row["sdud_national_excluded"] = str(len(national))
+            row["sdud_completeness"] = _s(sd.get("_completeness", "")) if isinstance(sd, dict) else ""
             if exact:
                 row["src_sdud"] = 1
                 row["src_sdud_status"] = S_HIT
@@ -657,6 +763,10 @@ for ndc11 in all_ndc11:
                 row["sdud_units"] = fi(su)
                 row["sdud_rx"] = fi(sx)
                 row["sdud_reimb"] = ff(ss)
+            elif national:
+                # Only national-total rows matched: no state-level data to aggregate.
+                row["src_sdud_status"] = S_NO_DATA
+                row["sdud_count"] = "0 state rows"
             else:
                 row["src_sdud_status"] = S_BAD_FILTER
                 row["sdud_count"] = "0/" + str(len(sr))
@@ -842,7 +952,7 @@ for brand in brands:
             be["mc_st"] = S_NO_MATCH
 
     # Part B Annual
-    pba = recs_cms(G(pb_ann_urls[brand]))
+    pba = pick_ov(recs_cms(G(pb_ann_urls[brand])))
     if is_err(G(pb_ann_urls[brand])):
         be["pba_st"] = S_QUERY_ERROR
     elif not pba:
@@ -869,7 +979,7 @@ for brand in brands:
             be["pba_st"] = S_NO_MATCH
 
     # Part B Quarterly
-    pbq = recs_cms(G(pb_q_urls[brand]))
+    pbq = pick_ov(recs_cms(G(pb_q_urls[brand])))
     if is_err(G(pb_q_urls[brand])):
         be["pbq_st"] = S_QUERY_ERROR
     elif not pbq:
@@ -998,9 +1108,10 @@ COLS = [
     "src_pb_ann", "src_pb_ann_status",
     "src_pb_q", "src_pb_q_status",
     "nadac_eff_date", "nadac_per_unit", "nadac_unit", "nadac_otc",
-    "nadac_class", "nadac_count",
+    "nadac_class", "nadac_count", "nadac_sort",
     "sdud_count", "sdud_year", "sdud_quarter",
     "sdud_states", "sdud_units", "sdud_rx", "sdud_reimb",
+    "sdud_national_excluded", "sdud_completeness",
     "wac_cur_date", "wac_cur_price", "wac_hist_date", "wac_hist_price",
     "drugsfda_apps", "drugsfda_sponsors", "drugsfda_approval",
     "rxnav_rxcuis", "rxnav_names",

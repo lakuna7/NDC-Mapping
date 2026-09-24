@@ -20,17 +20,27 @@ set -euo pipefail
 #   bash ndc_derived_kpis.sh
 # ============================================================
 
+INPUT="${INPUT:-}"
 MATRIX_DIR="${MATRIX_DIR:-}"
 GEO_DIR="${GEO_DIR:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(dirname "$SCRIPT_DIR")}"
+
+# Auto-detect dirs from project layout if INPUT is given
+if [ -n "$INPUT" ] && [ -z "$MATRIX_DIR" ]; then
+    INPUT_SAFE=$(echo "$INPUT" | sed 's/[^A-Za-z0-9._-]/_/g')
+    MATRIX_DIR="$PROJECT_ROOT/exports/tables/source_matrix_$INPUT_SAFE"
+    GEO_DIR="$PROJECT_ROOT/exports/tables/geo_matrix_$INPUT_SAFE"
+fi
+
 if [ -z "$MATRIX_DIR" ] || [ -z "$GEO_DIR" ]; then
-    echo "Usage: MATRIX_DIR=<path> GEO_DIR=<path> bash ndc_derived_kpis.sh" >&2
-    echo "  MATRIX_DIR = output dir from ndc_source_matrix.sh" >&2
-    echo "  GEO_DIR    = output dir from ndc_geo_matrix.sh" >&2
+    echo "Usage: INPUT=<ndc> bash ndc_derived_kpis.sh" >&2
+    echo "   or: MATRIX_DIR=<path> GEO_DIR=<path> bash ndc_derived_kpis.sh" >&2
     exit 1
 fi
 
-export MATRIX_DIR GEO_DIR
+export MATRIX_DIR GEO_DIR PROJECT_ROOT BASH_SOURCE_DIR="$SCRIPT_DIR"
 
 exec python3 - <<'ENDOFPYTHON'
 import csv
@@ -358,8 +368,14 @@ for row in matrix_rows:
     output_rows.append(out)
 
 # Write
-OUTDIR = MATRIX_DIR  # Co-locate with source matrix output
-csv_path = OUTDIR / "ndc11_derived_kpis.csv"
+_root_env = os.environ.get("PROJECT_ROOT", "").strip()
+if _root_env:
+    PROJECT_ROOT = Path(_root_env)
+else:
+    PROJECT_ROOT = MATRIX_DIR.parent.parent.parent  # exports/tables/source_matrix_X -> root
+KPIS_DIR = PROJECT_ROOT / "exports" / "tables" / "derived_kpis"
+KPIS_DIR.mkdir(parents=True, exist_ok=True)
+csv_path = KPIS_DIR / "ndc11_derived_kpis.csv"
 
 with open(str(csv_path), "w", newline="", encoding="utf-8") as fh:
     w = csv.DictWriter(fh, fieldnames=ALL_KPI_COLS, extrasaction="ignore")

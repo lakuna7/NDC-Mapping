@@ -20,6 +20,11 @@ CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
 
 export INPUT OPENFDA_API_KEY MAX_WORKERS CACHE_TTL_HOURS
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(dirname "$SCRIPT_DIR")}"
+export PROJECT_ROOT
+export BASH_SOURCE_DIR="$SCRIPT_DIR"
+
 exec python3 - <<'ENDOFPYTHON'
 import csv
 import hashlib
@@ -69,14 +74,21 @@ def upper_clean(x):
     return re.sub(r"\s+", " ", _ss(x)).upper()
 
 INPUT_SAFE = safe_filename(INPUT) if INPUT else "EMPTY"
-_outdir_env = os.environ.get("OUTDIR", "").strip()
-if _outdir_env:
-    OUTDIR = Path(_outdir_env)
+_root_env = os.environ.get("PROJECT_ROOT", "").strip()
+if _root_env:
+    PROJECT_ROOT = Path(_root_env)
 else:
-    OUTDIR = Path.home() / ("ndc_shortages_" + INPUT_SAFE)
-CACHE_DIR = OUTDIR / "cache"
-OUTDIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _script_dir = Path(os.environ.get("BASH_SOURCE_DIR", "")).resolve() if os.environ.get("BASH_SOURCE_DIR") else Path.cwd()
+    if _script_dir.name == "commands":
+        PROJECT_ROOT = _script_dir.parent
+    else:
+        PROJECT_ROOT = _script_dir
+TABLES_DIR = PROJECT_ROOT / "exports" / "tables" / ("shortages_" + INPUT_SAFE)
+LOGS_DIR = PROJECT_ROOT / "exports" / "logs"
+CACHE_DIR = PROJECT_ROOT / "local-data" / ("cache_shortages_" + INPUT_SAFE)
+for d in [TABLES_DIR, LOGS_DIR, CACHE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+OUTDIR = TABLES_DIR
 
 def log(msg):
     print("[ndc-short] " + _s(msg), file=sys.stderr, flush=True)
@@ -525,8 +537,22 @@ for ndc11 in all_ndc11:
         ) else "N_RESOLVED"
         row["shortage_count"] = str(len(recs))
 
-        # Use most recent record
-        recs_sorted = sorted(recs, key=lambda r: _s(r.get("update_date", r.get("initial_posting_date", ""))), reverse=True)
+        # Most recent record among CURRENT (unresolved) records, so the displayed
+        # status always agrees with shortage_flag. Falls back to all records
+        # only when every record is resolved (see `current` above).
+        def _shortage_date_key(r):
+            from datetime import datetime as _dt
+            for k in ("update_date", "initial_posting_date"):
+                v = _ss(r.get(k, ""))
+                if not v:
+                    continue
+                for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y%m%d", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        return _dt.strptime(v, fmt)
+                    except ValueError:
+                        continue
+            return _dt.min
+        recs_sorted = sorted(current, key=_shortage_date_key, reverse=True)
         latest = recs_sorted[0]
 
         row["shortage_status"] = _ss(latest.get("status"))
@@ -573,7 +599,7 @@ run_log = {
     "output_file": str(csv_path),
 }
 
-(OUTDIR / "run_log.json").write_text(json.dumps(run_log, indent=2, ensure_ascii=False), encoding="utf-8")
+(LOGS_DIR / ("run_log_shortages_" + INPUT_SAFE + ".json")).write_text(json.dumps(run_log, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # Console summary
 print("")
@@ -590,7 +616,7 @@ print("  RUNTIME            : " + str(run_log["runtime_seconds"]) + "s")
 print("")
 print("FILES:")
 print("  " + str(csv_path))
-print("  " + str(OUTDIR / "run_log.json"))
+print("  " + str(LOGS_DIR / ("run_log_shortages_" + INPUT_SAFE + ".json")))
 print("")
 
 # Preview
